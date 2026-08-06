@@ -1,0 +1,15 @@
+.gradle
+.idea
+.vscode
+.pv
+.store
+.claude
+.codex
+.mercurius
+mercurius.yaml
+*.db
+CODEX-*.md
+node_modules
+tsconfig.tsbuildinfo
+.env.local
+.env.*.local
