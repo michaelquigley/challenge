@@ -7,6 +7,9 @@
 .codex
 .mercurius
 mercurius.yaml
+.challenge
+go.work
+go.work.sum
 *.db
 CODEX-*.md
 node_modules
