@@ -177,6 +177,7 @@ type serveOptions struct {
 	exitOnStop  int
 	closeAfter  time.Duration
 	markerAfter time.Duration
+	refuseIf    string
 	orphan      bool
 	drift       bool
 }
@@ -184,6 +185,14 @@ type serveOptions struct {
 // serve runs the toy's wire surface.
 func serve(args []string) {
 	opts := parseServeOptions(args)
+
+	if opts.refuseIf != "" {
+		if _, err := os.Stat(opts.refuseIf); err == nil {
+			// refuses to come up at all, so a boundary restart can be pressed on
+			// without the first start having to fail too.
+			fail("refusing to start while %s exists", opts.refuseIf)
+		}
+	}
 
 	if opts.orphan {
 		// a process the fixture started, sharing its group and outliving a group
@@ -357,6 +366,12 @@ func parseServeOptions(args []string) serveOptions {
 		case "--marker-after":
 			i++
 			opts.markerAfter = mustDuration(args, i)
+		case "--refuse-if":
+			i++
+			if i >= len(args) {
+				fail("--refuse-if wants a path")
+			}
+			opts.refuseIf = args[i]
 		default:
 			fail("unknown serve flag %q", args[i])
 		}

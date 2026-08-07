@@ -581,7 +581,7 @@ func (w *W) publishBoundary(boundary int, name string) (checkpointRef, error) {
 		w.faultf("refusing to snapshot boundary %d: %v", boundary, err)
 		return checkpointRef{}, fmt.Errorf("boundary %d cannot be snapshotted from divergent harness state: %w", boundary, err)
 	}
-	return newCheckpoints(w.home.checkpointsDir()).publish(boundary, name, w.run.RunId, w.home.world())
+	return newCheckpoints(w.home.checkpointsDir()).publish(boundary, name, w.run.SessionId, w.run.RunId, w.home.world())
 }
 
 // requireHarnessStateIntact checks that what is about to be copied still says what

@@ -131,6 +131,9 @@ const (
 	// StatusNotRun is a challenge the invocation never reached because a terminal
 	// finding ended the corridor first.
 	StatusNotRun
+	// StatusSkipped is a challenge the invocation was never asked to run, which is
+	// a different statement from one it failed to reach.
+	StatusSkipped
 )
 
 // String names the status for renderers.
@@ -144,6 +147,8 @@ func (s ChallengeStatus) String() string {
 		return "executed"
 	case StatusNotRun:
 		return "not-run"
+	case StatusSkipped:
+		return "not-requested"
 	default:
 		return fmt.Sprintf("status(%d)", int(s))
 	}
@@ -162,6 +167,46 @@ type ChallengeRun struct {
 	Checkpoint string
 	Started    time.Time
 	Ended      time.Time
+
+	// sealed records that every phase which could add to this record has finished.
+	sealed bool
+}
+
+// Sealed reports whether this record is settled — whether everything that could
+// still add a step or a finding to it has run.
+//
+// renderers walk only sealed records. a challenge is not finished when its body
+// returns: its boundary can still find a fixture dead, cleanup can still settle a
+// wire failure that was waiting to learn what it was, and a report written before
+// those would say "ok" beside a finding the model was about to record.
+func (c *ChallengeRun) Sealed() bool { return c.sealed }
+
+// seal declares a record settled. from here, adding to it is a programming error
+// rather than a finding: it means the engine published something as true before it
+// was.
+func (c *ChallengeRun) seal() { c.sealed = true }
+
+// sealViolation is panicked when something adds to a record already declared
+// settled. it is not a class in the census — the census is about the world under
+// test, and this is about the harness sequencing itself wrongly.
+type sealViolation struct {
+	record string
+}
+
+// Worst reports the highest-order class among a challenge's findings, and whether
+// it recorded any. ranking classes is census knowledge and lives with the census,
+// so a renderer asks rather than deriving an order of its own.
+func (c *ChallengeRun) Worst() (FindingClass, bool) {
+	if len(c.Findings) == 0 {
+		return ClassAssertion, false
+	}
+	worst := c.Findings[0].Class
+	for _, f := range c.Findings {
+		if f.Class > worst {
+			worst = f.Class
+		}
+	}
+	return worst, true
 }
 
 // Run is the model of one invocation: pure data, written by the engine and walked
@@ -174,9 +219,13 @@ type Run struct {
 	SessionId string
 	// RunId identifies this invocation, stamped through the model, the transcript's
 	// attempt section, and the checkpoints it publishes.
-	RunId      string
-	Started    time.Time
-	Ended      time.Time
+	RunId   string
+	Started time.Time
+	Ended   time.Time
+	// Bootstrap records what the consumer's pre-run hook did, kept apart from the
+	// corridor so its steps and findings are attributable to it rather than landing
+	// on whichever challenge happened to come first.
+	Bootstrap  *ChallengeRun
 	Challenges []*ChallengeRun
 	// Findings holds run-scoped findings: the ones that belong to no challenge,
 	// such as a refused lock, a failed bootstrap, or a divergent corridor.
@@ -196,11 +245,14 @@ func (r *Run) Challenge(name string) *ChallengeRun {
 	return nil
 }
 
-// AllFindings walks every finding in the run: run-scoped first, then each
-// challenge's in corridor order.
+// AllFindings walks every finding in the run: run-scoped first, then the
+// bootstrap's, then each challenge's in corridor order.
 func (r *Run) AllFindings() []*Finding {
 	out := make([]*Finding, 0, len(r.Findings))
 	out = append(out, r.Findings...)
+	if r.Bootstrap != nil {
+		out = append(out, r.Bootstrap.Findings...)
+	}
 	for _, c := range r.Challenges {
 		out = append(out, c.Findings...)
 	}

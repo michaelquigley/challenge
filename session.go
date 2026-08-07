@@ -93,16 +93,16 @@ func saveSession(path string, s *session) error {
 // snapshot untrue.
 func (s *session) validatePrefix(current []corridorEntry, through int) error {
 	if through > len(current) {
-		return fmt.Errorf("%w: session %s records %d challenges, the target sits at %d",
+		return fmt.Errorf("%w: session %s records %d challenges, the target sits at %d; clean the world to start a new generation",
 			errDivergentCorridor, s.Id, len(s.Corridor), through)
 	}
 	if through > len(s.Corridor) {
-		return fmt.Errorf("%w: session %s recorded %d challenges, the current gauntlet reaches %q at %d",
+		return fmt.Errorf("%w: session %s recorded %d challenges, the current gauntlet reaches %q at %d; clean the world to start a new generation",
 			errDivergentCorridor, s.Id, len(s.Corridor), current[through-1].Name, through)
 	}
 	for i := 0; i < through; i++ {
 		if s.Corridor[i].Name != current[i].Name {
-			return fmt.Errorf("%w: session %s recorded %q at position %d, the current gauntlet has %q",
+			return fmt.Errorf("%w: session %s recorded %q at position %d, the current gauntlet has %q; clean the world to start a new generation",
 				errDivergentCorridor, s.Id, s.Corridor[i].Name, i+1, current[i].Name)
 		}
 	}

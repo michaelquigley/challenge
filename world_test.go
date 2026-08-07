@@ -99,7 +99,7 @@ func TestDepositsRideTheCheckpointAndRollBackWithIt(t *testing.T) {
 
 	w.Put("old-snap", "9f2c1ab77e40")
 	w.Setenv("REEF_WORKSPACE", "/world/ws")
-	ref, err := c.publish(1, "durability", "r_test", h.world())
+	ref, err := c.publish(1, "durability", "s_test", "r_test", h.world())
 	require.NoError(t, err)
 
 	// a deposit and an environment fact made after the save point are facts about
@@ -108,7 +108,7 @@ func TestDepositsRideTheCheckpointAndRollBackWithIt(t *testing.T) {
 	w.Setenv("REEF_DEBUG", "1")
 	assert.Equal(t, "deadbeefcafe", w.Get("new-snap"))
 
-	require.NoError(t, c.restore(ref, h.world()))
+	require.NoError(t, c.restore(ref, "s_test", h.world()))
 	require.NoError(t, w.reload())
 
 	assert.Equal(t, "9f2c1ab77e40", w.Get("old-snap"), "the deposit rides the checkpoint")

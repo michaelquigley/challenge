@@ -42,7 +42,7 @@ func TestTheFixtureRegistryRollsBackWithTheWorld(t *testing.T) {
 	f, _ := serveFixture(t, "server")
 	c := newCheckpoints(h.checkpointsDir())
 
-	ref, err := c.publish(1, "before", "r_test", h.world())
+	ref, err := c.publish(1, "before", "s_test", "r_test", h.world())
 	require.NoError(t, err)
 
 	w.Start(f)
@@ -51,7 +51,7 @@ func TestTheFixtureRegistryRollsBackWithTheWorld(t *testing.T) {
 
 	// a fixture a later challenge registered is a fact about a future the restore
 	// abandons, so a resumed run never starts it.
-	require.NoError(t, c.restore(ref, h.world()))
+	require.NoError(t, c.restore(ref, "s_test", h.world()))
 	require.NoError(t, w.reload())
 	assert.Empty(t, w.specs, "the registry rides the checkpoint image")
 	assert.Empty(t, cur.Findings)

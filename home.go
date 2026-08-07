@@ -125,7 +125,7 @@ func (h *home) reset(corridor []corridorEntry, runId string) (*session, error) {
 	if err := saveRunState(h.runStatePath(), &runState{}); err != nil {
 		return nil, err
 	}
-	if _, err := newCheckpoints(h.checkpointsDir()).publish(0, genesisName, runId, h.world()); err != nil {
+	if _, err := newCheckpoints(h.checkpointsDir()).publish(0, genesisName, s.Id, runId, h.world()); err != nil {
 		return nil, fmt.Errorf("publishing the genesis boundary: %w", err)
 	}
 	return s, nil
@@ -216,6 +216,9 @@ func (h *home) navigate(current []corridorEntry, target int, mode resumeMode) (c
 		return checkpointRef{}, fmt.Errorf("%w before %q at position %d in session %s",
 			errNoSavePoint, current[target-1].Name, target, s.Id)
 	}
+	if err := requireCorridorPlace(s, ref); err != nil {
+		return checkpointRef{}, err
+	}
 
 	rs, err := loadRunState(h.runStatePath())
 	if err != nil {
@@ -225,7 +228,7 @@ func (h *home) navigate(current []corridorEntry, target int, mode resumeMode) (c
 	if err := saveRunState(h.runStatePath(), rs); err != nil {
 		return checkpointRef{}, err
 	}
-	if err := c.restore(ref, h.world()); err != nil {
+	if err := c.restore(ref, s.Id, h.world()); err != nil {
 		return checkpointRef{}, err
 	}
 	if err := c.removeAbove(ref.Boundary); err != nil {
@@ -240,6 +243,35 @@ func (h *home) navigate(current []corridorEntry, target int, mode resumeMode) (c
 		return checkpointRef{}, err
 	}
 	return ref, nil
+}
+
+// requireCorridorPlace checks a save point holds the world the session says
+// belongs at its boundary.
+//
+// listing already proved the save point is what it claims to be — its manifest is
+// readable, and the directory it sits in agrees with it. this is the other half:
+// that what it claims matches the corridor this session recorded. a save point
+// published by another generation, or holding the world after a challenge the
+// session does not have at that position, would restore a world nobody closed
+// there.
+func requireCorridorPlace(s *session, ref checkpointRef) error {
+	want := genesisName
+	if ref.Boundary > 0 {
+		if ref.Boundary > len(s.Corridor) {
+			return fmt.Errorf("%w: boundary %d lies past the %d challenges session %s recorded",
+				errDivergentCorridor, ref.Boundary, len(s.Corridor), s.Id)
+		}
+		want = s.Corridor[ref.Boundary-1].Name
+	}
+	switch {
+	case ref.Session != s.Id:
+		return fmt.Errorf("%w: %s was published by session %s, not %s; clean the world to start a new generation",
+			errDivergentCorridor, ref.Dir, ref.Session, s.Id)
+	case ref.Name != want:
+		return fmt.Errorf("%w: boundary %d holds the world after %q, but session %s records %q there; clean the world to start a new generation",
+			errDivergentCorridor, ref.Boundary, ref.Name, s.Id, want)
+	}
+	return nil
 }
 
 // requireCompletePrune refuses navigation when an earlier one never finished.

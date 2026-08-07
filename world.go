@@ -359,6 +359,25 @@ func (w *W) Exists(rel string) {
 	}
 }
 
+// Has reports whether a path is present, without asserting anything about it.
+//
+// setup legitimately branches on what is already there, and a question is not a
+// claim. absence still means only ENOENT: a path the harness cannot stat at all is
+// its own problem, and answering "no" for one would be a guess dressed as a fact.
+func (w *W) Has(rel string) bool {
+	p := w.Path(rel)
+	_, err := os.Lstat(p)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, fs.ErrNotExist):
+		return false
+	default:
+		w.faultf("checking %s: %v", rel, err)
+		return false
+	}
+}
+
 // Absent asserts a path is not present. absence is only ever ENOENT: any other
 // error means the harness could not tell, and reading that as "not there" is how a
 // suite passes on a world it never saw.
@@ -407,6 +426,7 @@ func (w *W) Fail(format string, args ...any) {
 // step appends an action to the challenge now executing and hands it back so the
 // caller can complete it.
 func (w *W) step(kind StepKind, label, detail string) *Step {
+	w.requireUnsealed()
 	s := &Step{Kind: kind, Label: label, Detail: detail, At: time.Now()}
 	w.cur.Steps = append(w.cur.Steps, s)
 	return s
@@ -427,6 +447,7 @@ func (w *W) record(class FindingClass, message, detail string) {
 // resolved after later steps have already been taken, so it says which step it is
 // about rather than which one happened to be last.
 func (w *W) recordAt(class FindingClass, step int, message, detail string) {
+	w.requireUnsealed()
 	f := &Finding{Class: class, Message: message, Detail: detail, Step: step, At: time.Now()}
 	w.cur.Findings = append(w.cur.Findings, f)
 	// a run already on its way out records what it finds during cleanup rather
@@ -481,9 +502,24 @@ func (w *W) resolvePendingBreaks() {
 // recordQuiet appends a finding without unwinding, for the paths where a different
 // finding is about to end the run and both statements have to survive.
 func (w *W) recordQuiet(class FindingClass, message, detail string) {
+	w.requireUnsealed()
 	w.cur.Findings = append(w.cur.Findings, &Finding{
 		Class: class, Message: message, Detail: detail, Step: w.stepIndex(), At: time.Now(),
 	})
+}
+
+// requireUnsealed refuses to add to a record the engine has already declared
+// settled.
+//
+// the honest order is not something to remember at each call site. a record seals
+// when the engine moves focus off it, and everything that could still change it has
+// therefore already run — so writing to one afterwards means the engine reported
+// something before it was true, and that is a bug in the harness rather than a
+// statement about the world.
+func (w *W) requireUnsealed() {
+	if w.cur.sealed {
+		panic(sealViolation{record: w.cur.Name})
+	}
 }
 
 // abandon leaves the invocation without recording a new finding.

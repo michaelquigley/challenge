@@ -96,11 +96,13 @@ func TestCleanEmptiesTheTreeAndSparesTheLock(t *testing.T) {
 // naming the boundary it closes, so a restore can be told apart from a no-op.
 func buildChain(t *testing.T, h *home, names ...string) []checkpointRef {
 	t.Helper()
+	s, err := loadSession(h.sessionPath())
+	require.NoError(t, err)
 	c := newCheckpoints(h.checkpointsDir())
 	var refs []checkpointRef
 	for i, name := range names {
 		require.NoError(t, os.WriteFile(filepath.Join(h.world(), "boundary"), []byte(name), 0o644))
-		ref, err := c.publish(i, name, "r_test", h.world())
+		ref, err := c.publish(i, name, s.Id, "r_test", h.world())
 		require.NoError(t, err)
 		refs = append(refs, ref)
 	}
@@ -196,9 +198,13 @@ func TestNavigationFailsClosed(t *testing.T) {
 	require.Error(t, err)
 	require.NoError(t, os.Chmod(h.checkpointsDir(), 0o755))
 
-	surviving, err := newCheckpoints(h.checkpointsDir()).list()
-	require.NoError(t, err)
-	require.Len(t, surviving, 4, "the abandoned future did in fact survive this failure")
+	// the prune reached one save point and could not finish it: the directory
+	// survives with its manifest gone. a chain holding something that cannot say
+	// what it is refuses to be read at all, which is the strongest form of the
+	// guarantee — the abandoned future is not merely unselectable, it is
+	// unresolvable.
+	_, err = newCheckpoints(h.checkpointsDir()).list()
+	require.Error(t, err, "the abandoned future did in fact survive this failure")
 
 	rs, err := loadRunState(h.runStatePath())
 	require.NoError(t, err)
@@ -220,4 +226,31 @@ func TestNavigationFailsClosed(t *testing.T) {
 	_, err = h.reset(toyCorridor, "r_test")
 	require.NoError(t, err)
 	assert.NoError(t, h.requireCompletePrune())
+}
+
+func TestASavePointCarriesItsOwnIdentity(t *testing.T) {
+	h := testHome(t)
+	_, err := h.reset(toyCorridor, "r_test")
+	require.NoError(t, err)
+	buildChain(t, h, genesisName, "estate", "containers")
+
+	// a directory name is a label, and a label can be changed independently of what
+	// it labels. filing one boundary's world under another's name would restore a
+	// world nobody closed at that coordinate — so the answer comes from inside the
+	// save point rather than from the directory holding it.
+	require.NoError(t, removeTree(filepath.Join(h.checkpointsDir(), "01-estate")))
+	require.NoError(t, os.MkdirAll(filepath.Join(h.checkpointsDir(), "01-estate"), 0o755))
+	require.NoError(t, copyTree(
+		filepath.Join(h.checkpointsDir(), "02-containers"),
+		filepath.Join(h.checkpointsDir(), "01-estate")))
+
+	_, err = h.navigate(toyCorridor, 2, resumeReplay)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "published as boundary 2")
+	assert.Contains(t, err.Error(), "clean the world")
+
+	// and the world it would have restored was left alone.
+	body, err := os.ReadFile(filepath.Join(h.world(), "boundary"))
+	require.NoError(t, err)
+	assert.Equal(t, "containers", string(body))
 }

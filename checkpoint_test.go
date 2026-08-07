@@ -149,14 +149,14 @@ func TestPublishIsAtomic(t *testing.T) {
 	buildWorld(t, h.world())
 	c := newCheckpoints(h.checkpointsDir())
 
-	ref, err := c.publish(0, genesisName, "r_test", h.world())
+	ref, err := c.publish(0, genesisName, "s_test", "r_test", h.world())
 	require.NoError(t, err)
 	assert.Equal(t, "00-genesis", filepath.Base(ref.Dir))
 
 	// a world the contract cannot carry produces no checkpoint at all — not a
 	// partial one, and not a directory a later resolver could reach.
 	require.NoError(t, unix.Mkfifo(filepath.Join(h.world(), "pipe"), 0o644))
-	_, err = c.publish(1, "durability", "r_test", h.world())
+	_, err = c.publish(1, "durability", "s_test", "r_test", h.world())
 	require.ErrorIs(t, err, errUnsupportedNode)
 
 	refs, err := c.list()
@@ -176,14 +176,14 @@ func TestRepublishingABoundaryRetiresRatherThanErases(t *testing.T) {
 	c := newCheckpoints(h.checkpointsDir())
 
 	require.NoError(t, os.WriteFile(filepath.Join(h.world(), "boundary"), []byte("first"), 0o644))
-	_, err := c.publish(1, "estate", "r_one", h.world())
+	_, err := c.publish(1, "estate", "s_test", "r_one", h.world())
 	require.NoError(t, err)
 
 	require.NoError(t, os.WriteFile(filepath.Join(h.world(), "boundary"), []byte("second"), 0o644))
-	ref, err := c.publish(1, "estate", "r_two", h.world())
+	ref, err := c.publish(1, "estate", "s_test", "r_two", h.world())
 	require.NoError(t, err)
 
-	body, err := os.ReadFile(filepath.Join(ref.Dir, "boundary"))
+	body, err := os.ReadFile(filepath.Join(ref.image(), "boundary"))
 	require.NoError(t, err)
 	assert.Equal(t, "second", string(body))
 
@@ -201,7 +201,7 @@ func TestListRefusesCorruptedCheckpointState(t *testing.T) {
 	h := testHome(t)
 	c := newCheckpoints(h.checkpointsDir())
 	require.NoError(t, os.WriteFile(filepath.Join(h.world(), "state"), []byte("x"), 0o644))
-	_, err := c.publish(0, genesisName, "r_test", h.world())
+	_, err := c.publish(0, genesisName, "s_test", "r_test", h.world())
 	require.NoError(t, err)
 
 	// a save point replaced by a file is corrupted harness-owned state, and
@@ -226,7 +226,7 @@ func TestRestoreIsFaithfulAfterMutation(t *testing.T) {
 	buildWorld(t, h.world())
 	c := newCheckpoints(h.checkpointsDir())
 
-	ref, err := c.publish(1, "durability", "r_test", h.world())
+	ref, err := c.publish(1, "durability", "s_test", "r_test", h.world())
 	require.NoError(t, err)
 	saved := scanTree(t, h.world())
 
@@ -240,7 +240,7 @@ func TestRestoreIsFaithfulAfterMutation(t *testing.T) {
 	require.NoError(t, os.Symlink("/dev/null", filepath.Join(h.world(), "ws", "latest.wav")))
 	require.NoError(t, os.RemoveAll(filepath.Join(h.world(), "usb2")))
 
-	require.NoError(t, c.restore(ref, h.world()))
+	require.NoError(t, c.restore(ref, "s_test", h.world()))
 	assert.Equal(t, saved, scanTree(t, h.world()))
 }
 
@@ -250,7 +250,7 @@ func TestResumeResolvesStrictlyBeforeItsTarget(t *testing.T) {
 	c := newCheckpoints(h.checkpointsDir())
 
 	for i, name := range []string{genesisName, "estate", "containers", "slices"} {
-		_, err := c.publish(i, name, "r_test", h.world())
+		_, err := c.publish(i, name, "s_test", "r_test", h.world())
 		require.NoError(t, err)
 	}
 
@@ -282,7 +282,7 @@ func TestRemoveAboveClearsTheAbandonedFuture(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(h.world(), "state"), []byte("x"), 0o644))
 	c := newCheckpoints(h.checkpointsDir())
 	for i, name := range []string{genesisName, "estate", "containers", "slices"} {
-		_, err := c.publish(i, name, "r_test", h.world())
+		_, err := c.publish(i, name, "s_test", "r_test", h.world())
 		require.NoError(t, err)
 	}
 

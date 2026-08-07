@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/michaelquigley/df/dd"
 	"github.com/michaelquigley/df/dl"
 	"golang.org/x/sys/unix"
 )
@@ -20,6 +21,13 @@ import (
 // reset so the corridor's first challenge resolves like any other rather than
 // being a special case.
 const genesisName = "genesis"
+
+// imageName is the world copy inside a save point, and metaName is the save
+// point's own account of what it is.
+const (
+	imageName = "world"
+	metaName  = "boundary.yaml"
+)
 
 // tmpPrefix marks a checkpoint still being built. a checkpoint becomes selectable
 // only by rename, so a failed or interrupted copy is never a save point.
@@ -199,6 +207,28 @@ type checkpointRef struct {
 	Boundary int
 	Name     string
 	Dir      string
+	// Session and RunId come from the save point's own manifest, not from anything
+	// about where it sits.
+	Session string
+	RunId   string
+}
+
+// image is where the world copy lives inside a save point.
+func (r checkpointRef) image() string { return filepath.Join(r.Dir, imageName) }
+
+// boundaryMeta is a save point's own account of what it is, written beside its
+// image and travelling with it.
+//
+// a directory name is a label, and a label can be changed independently of what it
+// labels. the manifest is the authority: the name is an index for finding and
+// ordering save points, and nothing more. every resolver reads identity from here,
+// so a world published at one coordinate can never be presented as another's.
+type boundaryMeta struct {
+	Session   string `dd:"+required"`
+	Boundary  int
+	Challenge string `dd:"+required"`
+	RunId     string `dd:"+required"`
+	CreatedAt time.Time
 }
 
 // checkpoints owns one world's save-point chain.
@@ -234,18 +264,35 @@ func (c *checkpoints) list() ([]checkpointRef, error) {
 		if !e.IsDir() {
 			return nil, fmt.Errorf("checkpoint entry %s in %s is not a directory", e.Name(), c.dir)
 		}
-		boundary, name, ok := parseCheckpointName(e.Name())
-		if !ok {
+		dir := filepath.Join(c.dir, e.Name())
+		meta, err := readBoundaryMeta(dir)
+		if err != nil {
+			return nil, err
+		}
+		// the directory name is an index, never an authority. one that disagrees
+		// with the manifest beside it means a save point has been moved or
+		// relabelled, and a world filed under a coordinate it was not published at
+		// would restore as a world nobody ever closed there.
+		if boundary, name, ok := parseCheckpointName(e.Name()); !ok {
 			return nil, fmt.Errorf("unrecognized checkpoint directory %s in %s", e.Name(), c.dir)
+		} else if boundary != meta.Boundary || name != safeName(meta.Challenge) {
+			return nil, fmt.Errorf("%s is filed as boundary %d after %q but was published as boundary %d after %q; clean the world to start a new generation",
+				dir, boundary, name, meta.Boundary, meta.Challenge)
 		}
 		// a boundary names exactly one closed world. two directories claiming the
 		// same one would let the exact-predecessor rule and the strictly-before
 		// rule restore different worlds from the same coordinate.
-		if other, dup := seen[boundary]; dup {
-			return nil, fmt.Errorf("boundary %d is claimed by both %s and %s in %s", boundary, other, e.Name(), c.dir)
+		if other, dup := seen[meta.Boundary]; dup {
+			return nil, fmt.Errorf("boundary %d is claimed by both %s and %s in %s", meta.Boundary, other, e.Name(), c.dir)
 		}
-		seen[boundary] = e.Name()
-		refs = append(refs, checkpointRef{Boundary: boundary, Name: name, Dir: filepath.Join(c.dir, e.Name())})
+		seen[meta.Boundary] = e.Name()
+		refs = append(refs, checkpointRef{
+			Boundary: meta.Boundary,
+			Name:     meta.Challenge,
+			Dir:      dir,
+			Session:  meta.Session,
+			RunId:    meta.RunId,
+		})
 	}
 	sort.Slice(refs, func(i, j int) bool { return refs[i].Boundary < refs[j].Boundary })
 	return refs, nil
@@ -292,7 +339,7 @@ func (c *checkpoints) greatestBelow(index int) (checkpointRef, bool, error) {
 // the copy builds under a temporary sibling and renames into its canonical name
 // only when it completes, so a failed or interrupted copy is never selectable by
 // the resume resolver.
-func (c *checkpoints) publish(boundary int, name, runId, world string) (checkpointRef, error) {
+func (c *checkpoints) publish(boundary int, name, sessionId, runId, world string) (checkpointRef, error) {
 	if err := os.MkdirAll(c.dir, 0o755); err != nil {
 		return checkpointRef{}, fmt.Errorf("preparing checkpoints %s: %w", c.dir, err)
 	}
@@ -302,14 +349,19 @@ func (c *checkpoints) publish(boundary int, name, runId, world string) (checkpoi
 	if err := removeTree(building); err != nil {
 		return checkpointRef{}, fmt.Errorf("clearing a stale build directory %s: %w", building, err)
 	}
-	if err := os.MkdirAll(building, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(building, imageName), 0o755); err != nil {
 		return checkpointRef{}, fmt.Errorf("preparing %s: %w", building, err)
 	}
-	if err := copyTree(world, building); err != nil {
+	if err := copyTree(world, filepath.Join(building, imageName)); err != nil {
 		// the failed copy is discarded rather than left behind: an unfaithful
 		// snapshot must not survive as anything a resolver could reach.
 		_ = removeTree(building)
 		return checkpointRef{}, fmt.Errorf("snapshotting the world into %s: %w", building, err)
+	}
+	meta := &boundaryMeta{Session: sessionId, Boundary: boundary, Challenge: name, RunId: runId, CreatedAt: time.Now()}
+	if err := dd.UnbindYAMLFile(meta, filepath.Join(building, metaName)); err != nil {
+		_ = removeTree(building)
+		return checkpointRef{}, fmt.Errorf("recording the identity of boundary %d: %w", boundary, err)
 	}
 	// a boundary being republished is retired by rename rather than deleted in
 	// place. deleting first would mean a failure partway through could leave a
@@ -365,15 +417,28 @@ func (c *checkpoints) publish(boundary int, name, runId, world string) (checkpoi
 // restore replaces the world with a save point's image. the copy is the same
 // honest one publication used, so a restored world is indistinguishable from the
 // world that was saved.
-func (c *checkpoints) restore(ref checkpointRef, world string) error {
+func (c *checkpoints) restore(ref checkpointRef, sessionId, world string) error {
+	// the manifest is read again here rather than trusted from the resolution that
+	// produced the ref: restore is the moment a world actually replaces another,
+	// and it is not a step that takes anything about its subject on faith.
+	meta, err := readBoundaryMeta(ref.Dir)
+	if err != nil {
+		return err
+	}
+	if meta.Session != sessionId {
+		return fmt.Errorf("%s was published by session %s, not %s", ref.Dir, meta.Session, sessionId)
+	}
+	if meta.Boundary != ref.Boundary {
+		return fmt.Errorf("%s was published as boundary %d, not %d", ref.Dir, meta.Boundary, ref.Boundary)
+	}
 	if err := removeTree(world); err != nil {
 		return fmt.Errorf("clearing the world %s: %w", world, err)
 	}
 	if err := os.MkdirAll(world, 0o755); err != nil {
 		return fmt.Errorf("preparing the world %s: %w", world, err)
 	}
-	if err := copyTree(ref.Dir, world); err != nil {
-		return fmt.Errorf("restoring %s into %s: %w", ref.Dir, world, err)
+	if err := copyTree(ref.image(), world); err != nil {
+		return fmt.Errorf("restoring %s into %s: %w", ref.image(), world, err)
 	}
 	dl.Debugf("restored checkpoint %s", ref.Dir)
 	return nil
@@ -415,6 +480,22 @@ func (c *checkpoints) clearBuilding() error {
 		}
 	}
 	return nil
+}
+
+// readBoundaryMeta reads a save point's own account of itself.
+//
+// a save point without a readable manifest cannot say what it is, and a resolver
+// that guessed on its behalf would be doing exactly what the manifest exists to
+// prevent.
+func readBoundaryMeta(dir string) (*boundaryMeta, error) {
+	meta, err := dd.NewYAMLFile[boundaryMeta](filepath.Join(dir, metaName))
+	if err != nil {
+		return nil, fmt.Errorf("reading the identity of %s: %w", dir, err)
+	}
+	if meta.Boundary < 0 {
+		return nil, fmt.Errorf("%s claims boundary %d", dir, meta.Boundary)
+	}
+	return meta, nil
 }
 
 // checkpointDirName renders a boundary's canonical directory name.
