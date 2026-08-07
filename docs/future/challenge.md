@@ -70,10 +70,12 @@ Observation carries the error tiers too. A broken harness input — an invalid e
 **HTTP channel.** The same world, interrogated over the wire. Results carry status and body, with dd-decoding available for structured assertions:
 
 ```go
-w.Get("/api/v1/archives/important/status").
+w.On("server").Get("/api/v1/archives/important/status").
     ExpectStatus(200).
     ExpectBody(`"satisfied":true`)
 ```
+
+The wire is addressed through the named fixture — `w.On(name)` returns a holdable handle, so a suite takes it once and interrogates freely. The spelling is load-bearing twice: the deposit store owns the bare `Get`/`Put`, and instance-scoped crash coalescing needs every request to name the fixture it interrogates — the identity the census depends on, visible at the call site.
 
 The channels are two views of one living world, and cross-surface coherence is a first-class assertion pattern challenge exists to make expressible: act through the CLI, verify through the API, and assert the surfaces agree — something neither handler tests nor curl smoke can say.
 

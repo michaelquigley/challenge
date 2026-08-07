@@ -2,6 +2,7 @@ package challenge
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/michaelquigley/df/dd"
@@ -55,12 +57,46 @@ type W struct {
 	cur  *ChallengeRun
 	kv   map[string]string
 	env  map[string]string
+
+	// ctx carries harness cancellation into every child the world spawns.
+	ctx context.Context
+	// cancelled records that the harness itself began terminating its children.
+	// it is set before any child is signalled, so a death observed afterward is
+	// the harness's own doing and never crash evidence.
+	cancelled atomic.Bool
+	// unwinding records that the run is already on its way out, so a finding
+	// raised during cleanup is recorded rather than re-entering the unwind.
+	unwinding bool
+
+	// pending holds completed results whose status nobody asserted. they carry an
+	// implicit expectation resolved when the challenge ends.
+	pending []verdictPending
+	// pendingBreaks holds wire failures whose meaning is not settled until the
+	// fixture behind them has stopped.
+	pendingBreaks []pendingBreak
+	// crashedFixtures names every fixture whose collapse has been attributed, so a
+	// deferred break knows not to report the same event a second time.
+	crashedFixtures map[string]bool
+
+	// specs is the registered fixture declarations, in start order. it rides the
+	// checkpoint image, so a resumed run knows what to restart and a restore rolls
+	// back fixtures a later challenge registered.
+	specs []fixtureSpec
+	// instances is the live processes, keyed by fixture name.
+	instances map[string]*instance
 }
 
 // newW opens a world handle over an existing tree, loading the harness-owned state
 // that rides the checkpoint image.
-func newW(h *home, run *Run, cur *ChallengeRun) (*W, error) {
-	w := &W{home: h, run: run, cur: cur}
+func newW(ctx context.Context, h *home, run *Run, cur *ChallengeRun) (*W, error) {
+	w := &W{
+		home:            h,
+		run:             run,
+		cur:             cur,
+		ctx:             ctx,
+		instances:       map[string]*instance{},
+		crashedFixtures: map[string]bool{},
+	}
 	if err := w.reload(); err != nil {
 		return nil, err
 	}
@@ -68,8 +104,9 @@ func newW(h *home, run *Run, cur *ChallengeRun) (*W, error) {
 }
 
 // reload re-reads the harness-owned world state. the engine calls it after a
-// restore, so deposits and world environment roll back with the world rather than
-// surviving in memory as facts from a future that was abandoned.
+// restore, so deposits, world environment, and registered fixtures roll back with
+// the world rather than surviving in memory as facts from a future that was
+// abandoned.
 func (w *W) reload() error {
 	kv, err := readHarnessMap(filepath.Join(w.home.harness(), kvName))
 	if err != nil {
@@ -79,7 +116,11 @@ func (w *W) reload() error {
 	if err != nil {
 		return err
 	}
-	w.kv, w.env = kv, env
+	specs, err := readProcessRegistry(filepath.Join(w.home.harness(), processName))
+	if err != nil {
+		return err
+	}
+	w.kv, w.env, w.specs = kv, env, specs
 	return nil
 }
 
@@ -371,20 +412,99 @@ func (w *W) step(kind StepKind, label, detail string) *Step {
 	return s
 }
 
-// record appends a finding and, for every class but assertion, unwinds the
-// invocation.
+// stepIndex is the position of the step now in flight, or -1 outside one.
+func (w *W) stepIndex() int {
+	return len(w.cur.Steps) - 1
+}
+
+// record appends a finding against the step in flight and, for every class but
+// assertion, unwinds the invocation.
 func (w *W) record(class FindingClass, message, detail string) {
-	f := &Finding{Class: class, Message: message, Detail: detail, Step: -1, At: time.Now()}
-	if len(w.cur.Steps) > 0 {
-		f.Step = len(w.cur.Steps) - 1
-	}
+	w.recordAt(class, w.stepIndex(), message, detail)
+}
+
+// recordAt appends a finding against a named step. an implicit expectation is
+// resolved after later steps have already been taken, so it says which step it is
+// about rather than which one happened to be last.
+func (w *W) recordAt(class FindingClass, step int, message, detail string) {
+	f := &Finding{Class: class, Message: message, Detail: detail, Step: step, At: time.Now()}
 	w.cur.Findings = append(w.cur.Findings, f)
-	if class.Terminal() {
+	// a run already on its way out records what it finds during cleanup rather
+	// than re-entering the unwind it is in the middle of.
+	if class.Terminal() && !w.unwinding {
 		panic(unwind{class: class})
 	}
 }
 
+// interrupted reports that the harness itself is ending the run.
+//
+// the recorded flag and the context have to be read together. whoever cancels the
+// context is the harness, and a child that dies because of it died by the
+// harness's hand — reading only the flag would let the same interruption arrive as
+// a product crash on the command channel and a product break on the wire.
+func (w *W) interrupted() bool {
+	return w.cancelled.Load() || w.ctx.Err() != nil
+}
+
+// pendingBreak is a wire failure waiting to learn what it was. a fixture that
+// stopped answering may be refusing and healthy, or a moment from dying, and only
+// cleanup can tell the difference.
+type pendingBreak struct {
+	instance string
+	message  string
+	step     int
+}
+
+// deferBreak leaves the invocation now and settles the finding at cleanup.
+func (w *W) deferBreak(instance, message string) {
+	w.pendingBreaks = append(w.pendingBreaks, pendingBreak{instance: instance, message: message, step: w.stepIndex()})
+	if !w.unwinding {
+		panic(unwind{class: ClassBreak})
+	}
+}
+
+// resolvePendingBreaks records the wire failures cleanup did not turn out to
+// explain. a fixture whose collapse has already been attributed keeps its one
+// finding at the higher tier; a wire that genuinely turned a request down gets its
+// break, attributed to the step that made the request.
+func (w *W) resolvePendingBreaks() {
+	pending := w.pendingBreaks
+	w.pendingBreaks = nil
+	for _, pb := range pending {
+		if w.crashedFixtures[pb.instance] {
+			continue
+		}
+		w.recordAt(ClassBreak, pb.step, pb.message, "")
+	}
+}
+
+// recordQuiet appends a finding without unwinding, for the paths where a different
+// finding is about to end the run and both statements have to survive.
+func (w *W) recordQuiet(class FindingClass, message, detail string) {
+	w.cur.Findings = append(w.cur.Findings, &Finding{
+		Class: class, Message: message, Detail: detail, Step: w.stepIndex(), At: time.Now(),
+	})
+}
+
+// abandon leaves the invocation without recording a new finding.
+//
+// harness cancellation is one interruption and earns one finding, recorded where
+// the interruption was received rather than again at every call it cut short. what
+// it does mark is the run itself: an interrupted run is an invalid run, and the
+// model has to say so on its own rather than depending on a face remembering to.
+func (w *W) abandon() {
+	w.run.Interrupted = true
+	if !w.unwinding {
+		panic(unwind{class: ClassFault})
+	}
+}
+
 // faultf records a harness fault: the harness or the suite itself is broken.
+//
+// it does not return — except once the run is already unwinding, when a finding is
+// recorded rather than re-entering the unwind. every call site reached during
+// cleanup therefore has to choose its own next step rather than assume there is
+// not one.
 func (w *W) faultf(format string, args ...any) {
 	w.record(ClassFault, fmt.Sprintf(format, args...), "")
 }

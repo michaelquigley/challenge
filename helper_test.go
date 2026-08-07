@@ -1,13 +1,20 @@
 package challenge
 
 import (
+	"context"
+	"fmt"
 	"io/fs"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // testHome builds an isolated gauntlet tree for one test, and makes sure the
@@ -22,16 +29,80 @@ func testHome(t *testing.T) *home {
 	return h
 }
 
-// testW opens a world handle over a fresh tree, focused on one challenge record.
+// testW opens a world handle over a fresh tree with the toy installed, focused on
+// one challenge record.
 func testW(t *testing.T) (*W, *ChallengeRun, *home) {
 	t.Helper()
 	h := testHome(t)
+	installToy(t, h)
 	run := &Run{Gauntlet: "toy", RunId: newId("r")}
 	cur := &ChallengeRun{Name: "probe", Status: StatusExecuted}
 	run.Challenges = append(run.Challenges, cur)
-	w, err := newW(h, run, cur)
+	w, err := newW(context.Background(), h, run, cur)
 	require.NoError(t, err)
+	// nothing supervised outlives the test that started it.
+	t.Cleanup(func() { w.shutdown() })
 	return w, cur, h
+}
+
+var (
+	toyOnce sync.Once
+	toyPath string
+	toyErr  error
+)
+
+// toyBinary builds the toy product once for the whole test binary.
+func toyBinary(t *testing.T) string {
+	t.Helper()
+	toyOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "challenge-toy-")
+		if err != nil {
+			toyErr = err
+			return
+		}
+		toyPath = filepath.Join(dir, "toy")
+		out, err := exec.Command("go", "build", "-o", toyPath, "./internal/toy").CombinedOutput()
+		if err != nil {
+			toyErr = fmt.Errorf("building the toy: %v: %s", err, out)
+		}
+	})
+	require.NoError(t, toyErr)
+	return toyPath
+}
+
+// installToy puts the toy in a world's bin/, the way a consumer's bootstrap hook
+// produces the binary under test — beside the world, never inside it.
+func installToy(t *testing.T, h *home) {
+	t.Helper()
+	data, err := os.ReadFile(toyBinary(t))
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(h.bin(), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(h.bin(), "toy"), data, 0o755))
+}
+
+// freePort borrows a port the way the harness does, for tests that need one before
+// a world exists.
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+// serveFixture declares a supervised toy server on a free port.
+func serveFixture(t *testing.T, name string, extra ...string) (Fixture, int) {
+	t.Helper()
+	port := freePort(t)
+	literal := fmt.Sprintf("toy serve --port %d %s", port, strings.Join(extra, " "))
+	return Fixture{
+		Name:         name,
+		Literal:      literal,
+		BaseURL:      fmt.Sprintf("http://127.0.0.1:%d", port),
+		ReadyURL:     "/api/v1/config",
+		ReadyTimeout: 10 * time.Second,
+		StopTimeout:  10 * time.Second,
+	}, port
 }
 
 // capture invokes fn the way the engine does, recovering the unwind a terminal
@@ -81,4 +152,10 @@ func makeDir(t *testing.T, path string, mode fs.FileMode, mod time.Time) {
 	require.NoError(t, os.MkdirAll(path, 0o755))
 	require.NoError(t, os.Chmod(path, mode))
 	require.NoError(t, os.Chtimes(path, mod, mod))
+}
+
+// unixGetpgid reports a process's group, for the pin that harness children are
+// isolated from the runner's foreground group.
+func unixGetpgid(pid int) (int, error) {
+	return unix.Getpgid(pid)
 }

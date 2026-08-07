@@ -316,27 +316,44 @@ func (c *checkpoints) publish(boundary int, name, runId, world string) (checkpoi
 	// half-erased image standing at the canonical name, where the resolver would
 	// find it and restore a world that was never saved. renaming keeps every
 	// intermediate state honest: the old complete image, or the new one.
-	retired := filepath.Join(c.dir, tmpPrefix+"retired-"+checkpointDirName(boundary, name)+"-"+runId)
 	replacing := false
 	if _, err := os.Lstat(canonical); err == nil {
-		if err := os.Rename(canonical, retired); err != nil {
-			_ = removeTree(building)
-			return checkpointRef{}, fmt.Errorf("retiring %s: %w", canonical, err)
-		}
 		replacing = true
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		_ = removeTree(building)
 		return checkpointRef{}, fmt.Errorf("inspecting %s: %w", canonical, err)
 	}
-	if err := os.Rename(building, canonical); err != nil {
-		_ = removeTree(building)
-		if replacing {
-			// the boundary is never left absent by a failure to replace it.
-			_ = os.Rename(retired, canonical)
+
+	switch {
+	case !replacing:
+		if err := os.Rename(building, canonical); err != nil {
+			_ = removeTree(building)
+			return checkpointRef{}, fmt.Errorf("publishing %s: %w", canonical, err)
 		}
-		return checkpointRef{}, fmt.Errorf("publishing %s: %w", canonical, err)
-	}
-	if replacing {
+
+	case swapPaths(building, canonical) == nil:
+		// the exchange put the new image at the canonical name and the old one
+		// where the build was. the boundary was never absent for an instant.
+		if err := removeTree(building); err != nil {
+			return checkpointRef{}, fmt.Errorf("discarding the replaced image %s: %w", building, err)
+		}
+
+	default:
+		// no single-step exchange here, so the old image is stood aside and the new
+		// one moved in. the window between the two renames leaves the boundary
+		// briefly at neither name, which fails closed: resume falls back to an
+		// earlier save point rather than reaching a partial one.
+		retired := filepath.Join(c.dir, tmpPrefix+"retired-"+checkpointDirName(boundary, name)+"-"+runId)
+		if err := os.Rename(canonical, retired); err != nil {
+			_ = removeTree(building)
+			return checkpointRef{}, fmt.Errorf("retiring %s: %w", canonical, err)
+		}
+		if err := os.Rename(building, canonical); err != nil {
+			_ = removeTree(building)
+			// the boundary is put back rather than left absent.
+			_ = os.Rename(retired, canonical)
+			return checkpointRef{}, fmt.Errorf("publishing %s: %w", canonical, err)
+		}
 		if err := removeTree(retired); err != nil {
 			return checkpointRef{}, fmt.Errorf("discarding the retired image %s: %w", retired, err)
 		}
