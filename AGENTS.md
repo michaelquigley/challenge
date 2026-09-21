@@ -54,6 +54,10 @@ That filter keeps four kinds of thing and discards the rest:
 
 Skip change inventories, restatements of the diff, and play-by-play of how you worked. There's no write-time approval gate; Michael reviews on commit. Append to the day's file if it exists, and write the few lines you'd want the next agent to read — honest and self-contained.
 
+## Commits
+
+The operator commits; agents don't. Never run `git commit` or `git push` in this repo. Finish the edit, leave the change in the working tree (staged is fine), report what changed, and hand off — the uncommitted diff is the review queue and the commit is the operator's act of acceptance. Approval of a change is not direction to commit; only an explicit instruction to commit is, and only for that commit.
+
 ## Documentation
 
 `docs/current/` describes what is built. `docs/future/` holds the intent layer — the spec and work order this library is being built from — and its documents are removed once realized.
